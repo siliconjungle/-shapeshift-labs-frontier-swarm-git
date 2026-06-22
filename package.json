@@ -1,0 +1,62 @@
+{
+  "name": "@shapeshift-labs/frontier-swarm-git",
+  "version": "0.1.0",
+  "description": "Node Git, workspace, patch, and apply adapter for Frontier swarm runners.",
+  "type": "module",
+  "license": "MIT",
+  "sideEffects": false,
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/siliconjungle/-shapeshift-labs-frontier-swarm-git.git"
+  },
+  "homepage": "https://github.com/siliconjungle/-shapeshift-labs-frontier-swarm-git#readme",
+  "bugs": {
+    "url": "https://github.com/siliconjungle/-shapeshift-labs-frontier-swarm-git/issues"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "benchmarks/package-bench.mjs"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "npm run build && npm run typecheck && node test/smoke.mjs && node test/fuzz.mjs --cases 100",
+    "prepack": "npm run test",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p test/tsconfig.json --noEmit",
+    "fuzz": "npm run build && node test/fuzz.mjs",
+    "bench": "npm run build && node benchmarks/package-bench.mjs --out benchmarks/results/frontier-swarm-git-package-bench-latest.json",
+    "pack:dry": "npm pack --dry-run"
+  },
+  "keywords": [
+    "frontier",
+    "swarm",
+    "git",
+    "workspace",
+    "patch",
+    "merge",
+    "agent",
+    "coordination"
+  ],
+  "dependencies": {
+    "@shapeshift-labs/frontier": "0.1.9",
+    "@shapeshift-labs/frontier-swarm": "0.5.25"
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.0",
+    "typescript": "^6.0.3"
+  }
+}

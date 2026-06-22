@@ -1,0 +1,5 @@
+node_modules/
+dist/
+*.tgz
+benchmarks/results/*.json
+!benchmarks/results/.gitkeep
