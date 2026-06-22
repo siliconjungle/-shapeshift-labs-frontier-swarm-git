@@ -3,6 +3,15 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import type { JsonObject, JsonValue } from '@shapeshift-labs/frontier';
+import {
+  acquireSemanticLease,
+  createSemanticLeaseFence,
+  createSemanticLeaseState,
+  defineChangedPathLeaseScopes,
+  releaseSemanticLease,
+  validateSemanticLeaseApply,
+  type FrontierSemanticLeaseState
+} from '@shapeshift-labs/frontier-lease';
 
 export const FRONTIER_SWARM_GIT_WORKSPACE_MANIFEST_KIND = 'frontier.swarm-git.workspace-manifest';
 export const FRONTIER_SWARM_GIT_WORKSPACE_MANIFEST_VERSION = 1;
@@ -358,6 +367,8 @@ export interface FrontierSwarmGitApplyInput {
   branchPrefix?: string;
   jobIds?: readonly string[];
   limit?: number;
+  leaseStatePath?: string | false;
+  leaseTtlMs?: number;
 }
 
 export interface FrontierSwarmGitApplySemanticLeaseEvidence {
@@ -406,6 +417,7 @@ export interface FrontierSwarmGitApplyResult {
   cwd: string;
   collectionDir: string;
   outDir: string;
+  leaseStatePath?: string;
   generatedAt: number;
   dryRun: boolean;
   entries: FrontierSwarmGitApplyEntry[];
@@ -417,6 +429,12 @@ export interface FrontierSwarmGitApplyResult {
     skipped: number;
     failed: number;
   };
+}
+
+interface FrontierSwarmGitApplyLeaseRuntime {
+  statePath: string;
+  state: FrontierSemanticLeaseState;
+  ttlMs?: number;
 }
 
 const WRITE_FENCE_LIMITATIONS = [
@@ -958,6 +976,12 @@ export async function applySwarmGitMergeCollection(input: FrontierSwarmGitApplyI
   const dryRun = input.dryRun ?? true;
   const collectionDir = path.resolve(cwd, input.collection);
   const outDir = path.resolve(cwd, input.outDir ?? path.join(collectionDir, 'apply-ledger'));
+  const leaseRuntime = input.leaseStatePath === false ? undefined : await createApplyLeaseRuntime({
+    cwd,
+    outDir,
+    leaseStatePath: input.leaseStatePath,
+    leaseTtlMs: input.leaseTtlMs
+  });
   if (!dryRun && !input.allowDirty) {
     const dirty = await swarmGitDirty(cwd);
     if (dirty.length) throw new Error(`refusing to apply into dirty worktree; pass allowDirty to override (${dirty.slice(0, 8).join(', ')})`);
@@ -978,7 +1002,8 @@ export async function applySwarmGitMergeCollection(input: FrontierSwarmGitApplyI
       mergePath,
       dryRun,
       commit: input.commit ?? false,
-      branchPrefix: input.branchPrefix
+      branchPrefix: input.branchPrefix,
+      leaseRuntime
     });
     entries.push(applied);
   }
@@ -997,6 +1022,7 @@ export async function applySwarmGitMergeCollection(input: FrontierSwarmGitApplyI
     cwd,
     collectionDir,
     outDir,
+    ...(leaseRuntime ? { leaseStatePath: leaseRuntime.statePath } : {}),
     generatedAt,
     dryRun,
     entries,
@@ -1164,6 +1190,7 @@ async function applySwarmGitMergeBundle(input: {
   dryRun: boolean;
   commit: boolean;
   branchPrefix?: string;
+  leaseRuntime?: FrontierSwarmGitApplyLeaseRuntime;
 }): Promise<FrontierSwarmGitApplyEntry> {
   const commands: FrontierSwarmGitApplyEntry['commands'] = [];
   const patchPath = await resolveApplyPatchPath(input.bundle, input.mergePath);
@@ -1183,10 +1210,12 @@ async function applySwarmGitMergeBundle(input: {
       error: 'missing patch'
     };
   }
-  const semanticLease = createApplySemanticLeaseEvidence({
+  const semanticLease = await acquireApplySemanticLease({
     cwd: input.cwd,
     bundle: input.bundle,
-    mergePath: input.mergePath
+    mergePath: input.mergePath,
+    leaseRuntime: input.leaseRuntime,
+    dryRun: input.dryRun
   });
   if (!semanticLease.entry.granted) {
     return {
@@ -1196,56 +1225,176 @@ async function applySwarmGitMergeBundle(input: {
       error: 'semantic lease denied'
     };
   }
+  const finish = async (entry: FrontierSwarmGitApplyEntry): Promise<FrontierSwarmGitApplyEntry> => {
+    await releaseApplySemanticLease(input.leaseRuntime, semanticLease.entry);
+    return entry;
+  };
   if (!semanticLease.entry.fence.ok) {
-    return {
+    return finish({
       ...base,
       semanticLease: semanticLease.entry,
       status: 'failed',
       error: 'semantic lease fence validation failed'
-    };
+    });
   }
   const check = await runLoggedProcess('git', ['apply', '--check', patchPath], input.cwd);
   commands.push(check);
-  if (check.status !== 0) return { ...base, semanticLease: semanticLease.entry, status: 'failed', error: 'git apply --check failed' };
-  if (input.dryRun) return { ...base, semanticLease: semanticLease.entry, status: 'checked' };
+  if (check.status !== 0) return finish({ ...base, semanticLease: semanticLease.entry, status: 'failed', error: 'git apply --check failed' });
+  if (input.dryRun) return finish({ ...base, semanticLease: semanticLease.entry, status: 'checked' });
   if (branchName) {
     const branch = await runLoggedProcess('git', ['switch', '-c', branchName], input.cwd);
     commands.push(branch);
-    if (branch.status !== 0) return { ...base, semanticLease: semanticLease.entry, status: 'failed', error: 'git switch -c failed' };
+    if (branch.status !== 0) return finish({ ...base, semanticLease: semanticLease.entry, status: 'failed', error: 'git switch -c failed' });
   }
   const apply = await runLoggedProcess('git', ['apply', patchPath], input.cwd);
   commands.push(apply);
-  if (apply.status !== 0) return { ...base, semanticLease: semanticLease.entry, status: 'failed', error: 'git apply failed' };
-  if (!input.commit) return { ...base, semanticLease: semanticLease.entry, status: 'applied' };
+  if (apply.status !== 0) return finish({ ...base, semanticLease: semanticLease.entry, status: 'failed', error: 'git apply failed' });
+  if (!input.commit) return finish({ ...base, semanticLease: semanticLease.entry, status: 'applied' });
   const add = await runLoggedProcess('git', ['add', '--', ...input.bundle.changedPaths], input.cwd);
   commands.push(add);
-  if (add.status !== 0) return { ...base, semanticLease: semanticLease.entry, status: 'failed', error: 'git add failed' };
+  if (add.status !== 0) return finish({ ...base, semanticLease: semanticLease.entry, status: 'failed', error: 'git add failed' });
   const commit = await runLoggedProcess('git', ['commit', '-m', `Apply swarm bundle ${input.bundle.jobId}`], input.cwd);
   commands.push(commit);
-  if (commit.status !== 0) return { ...base, semanticLease: semanticLease.entry, status: 'failed', error: 'git commit failed' };
+  if (commit.status !== 0) return finish({ ...base, semanticLease: semanticLease.entry, status: 'failed', error: 'git commit failed' });
   const rev = await runLoggedProcess('git', ['rev-parse', 'HEAD'], input.cwd);
   commands.push(rev);
-  return {
+  return finish({
     ...base,
     semanticLease: semanticLease.entry,
     status: 'committed',
     commit: rev.stdoutTail[0]
-  };
+  });
 }
 
-function createApplySemanticLeaseEvidence(input: {
+async function createApplyLeaseRuntime(input: {
+  cwd: string;
+  outDir: string;
+  leaseStatePath?: string;
+  leaseTtlMs?: number;
+}): Promise<FrontierSwarmGitApplyLeaseRuntime> {
+  const statePath = path.resolve(input.cwd, input.leaseStatePath ?? path.join(input.outDir, 'semantic-lease-state.json'));
+  const state = await readApplyLeaseState(statePath, input.cwd);
+  const runtime = { statePath, state, ttlMs: input.leaseTtlMs };
+  await writeApplyLeaseState(runtime);
+  return runtime;
+}
+
+async function readApplyLeaseState(file: string, cwd: string): Promise<FrontierSemanticLeaseState> {
+  if (await pathExists(file)) {
+    return createSemanticLeaseState(JSON.parse(await fs.readFile(file, 'utf8')) as FrontierSemanticLeaseState);
+  }
+  return createSemanticLeaseState({
+    id: `frontier-swarm-git-apply:${stableHash([cwd, file])}`,
+    metadata: {
+      source: 'frontier-swarm-git',
+      cwd
+    }
+  });
+}
+
+async function writeApplyLeaseState(runtime: FrontierSwarmGitApplyLeaseRuntime): Promise<void> {
+  await fs.mkdir(path.dirname(runtime.statePath), { recursive: true });
+  await fs.writeFile(runtime.statePath, JSON.stringify(runtime.state, null, 2) + '\n');
+}
+
+async function acquireApplySemanticLease(input: {
   cwd: string;
   bundle: FrontierSwarmGitMergeBundle;
   mergePath: string;
-}): { entry: FrontierSwarmGitApplySemanticLeaseEvidence } {
+  leaseRuntime?: FrontierSwarmGitApplyLeaseRuntime;
+  dryRun: boolean;
+}): Promise<{ entry: FrontierSwarmGitApplySemanticLeaseEvidence }> {
   const repository = path.basename(input.cwd);
   const changedPaths = uniqueSwarmGitWorkspacePaths(input.bundle.changedPaths);
-  const scopes = changedPaths.map((file) => ({
-    key: `path:${repository}:${file}`,
-    scopeKind: 'path',
-    path: file,
-    parentKeys: [`repository:${repository}`]
-  }));
+  const scopes = defineChangedPathLeaseScopes({
+    repository,
+    paths: changedPaths,
+    metadata: {
+      bundlePath: input.mergePath,
+      jobId: input.bundle.jobId
+    }
+  });
+  if (input.leaseRuntime) {
+    const now = Date.now();
+    const mutation = acquireSemanticLease(input.leaseRuntime.state, {
+      ownerId: `frontier-swarm-git:${input.bundle.jobId}`,
+      holderId: 'frontier-swarm-git',
+      now,
+      ttlMs: input.leaseRuntime.ttlMs,
+      purpose: `apply swarm bundle ${input.bundle.jobId}`,
+      reason: input.dryRun ? 'dry-run apply check' : 'apply merge bundle',
+      scopes,
+      metadata: {
+        bundlePath: input.mergePath,
+        dryRun: input.dryRun
+      }
+    });
+    input.leaseRuntime.state = mutation.state;
+    await writeApplyLeaseState(input.leaseRuntime);
+    if (!mutation.granted || !mutation.lease) {
+      return {
+        entry: {
+          source: 'frontier-lease',
+          queueId: input.leaseRuntime.state.id,
+          assignmentId: input.bundle.jobId,
+          stateId: input.leaseRuntime.state.id,
+          granted: false,
+          requiredLeaseScopeIds: scopes.map((scope) => scope.key),
+          requiredLeaseKeys: scopes.map((scope) => scope.key),
+          scopes: scopes.map(applyLeaseEvidenceScope),
+          fence: {
+            ok: false,
+            reasons: ['lease-denied']
+          },
+          evidence: {
+            authority: 'frontier-lease',
+            statePath: input.leaseRuntime.statePath,
+            outcome: mutation.outcome,
+            conflictCount: mutation.conflicts.length,
+            conflicts: mutation.conflicts
+          }
+        }
+      };
+    }
+    const fenceTicket = createSemanticLeaseFence(mutation.lease);
+    const validation = validateSemanticLeaseApply(input.leaseRuntime.state, {
+      fences: [fenceTicket],
+      scopes,
+      now,
+      requireExclusive: true
+    });
+    return {
+      entry: {
+        source: 'frontier-lease',
+        queueId: input.leaseRuntime.state.id,
+        assignmentId: input.bundle.jobId,
+        stateId: input.leaseRuntime.state.id,
+        granted: true,
+        leaseId: mutation.lease.id,
+        token: mutation.lease.token,
+        fencingToken: mutation.lease.fencingToken,
+        requiredLeaseScopeIds: scopes.map((scope) => scope.key),
+        requiredLeaseKeys: scopes.map((scope) => scope.key),
+        scopes: scopes.map(applyLeaseEvidenceScope),
+        fence: {
+          ok: validation.ok,
+          reasons: validation.reasons
+        },
+        evidence: {
+          authority: 'frontier-lease',
+          statePath: input.leaseRuntime.statePath,
+          holderId: mutation.lease.holderId,
+          expiresAt: mutation.lease.expiresAt,
+          coveredScopeKeys: validation.coveredScopeKeys,
+          uncoveredScopeKeys: validation.uncoveredScopeKeys,
+          invalidFenceReasons: validation.invalidFenceReasons,
+          sharedWriteScopeKeys: validation.sharedWriteScopeKeys,
+          conflicts: validation.conflicts
+        }
+      }
+    };
+  }
+  const evidenceScopes = scopes.map(applyLeaseEvidenceScope);
   return {
     entry: {
       source: 'derived-from-merge-bundle',
@@ -1253,9 +1402,9 @@ function createApplySemanticLeaseEvidence(input: {
       assignmentId: input.bundle.jobId,
       stateId: `frontier-swarm-git-apply-state:${stableHash([repository, input.bundle.jobId, changedPaths])}`,
       granted: true,
-      requiredLeaseScopeIds: scopes.map((scope) => scope.key),
-      requiredLeaseKeys: scopes.map((scope) => scope.key),
-      scopes,
+      requiredLeaseScopeIds: evidenceScopes.map((scope) => scope.key),
+      requiredLeaseKeys: evidenceScopes.map((scope) => scope.key),
+      scopes: evidenceScopes,
       fence: {
         ok: true,
         reasons: []
@@ -1266,6 +1415,33 @@ function createApplySemanticLeaseEvidence(input: {
         note: 'frontier-swarm-git records Git apply evidence only; coordinator packages own lease admission and fencing'
       }
     }
+  };
+}
+
+async function releaseApplySemanticLease(
+  runtime: FrontierSwarmGitApplyLeaseRuntime | undefined,
+  entry: FrontierSwarmGitApplySemanticLeaseEvidence
+): Promise<void> {
+  if (!runtime || !entry.leaseId || !entry.token) return;
+  const mutation = releaseSemanticLease(runtime.state, {
+    leaseId: entry.leaseId,
+    token: entry.token,
+    ownerId: `frontier-swarm-git:${entry.assignmentId ?? 'unknown'}`,
+    now: Date.now(),
+    reason: 'apply bundle finished'
+  });
+  runtime.state = mutation.state;
+  await writeApplyLeaseState(runtime);
+}
+
+function applyLeaseEvidenceScope(scope: ReturnType<typeof defineChangedPathLeaseScopes>[number]): FrontierSwarmGitApplySemanticLeaseEvidence['scopes'][number] {
+  return {
+    key: scope.key,
+    scopeKind: scope.scopeKind,
+    path: scope.path,
+    regionId: scope.regionId,
+    lane: scope.lane,
+    parentKeys: scope.parentKeys
   };
 }
 

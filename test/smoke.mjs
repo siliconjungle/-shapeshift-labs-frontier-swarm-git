@@ -125,8 +125,16 @@ const apply = await api.applySwarmGitMergeCollection({
 assert.strictEqual(apply.kind, api.FRONTIER_SWARM_GIT_APPLY_LEDGER_KIND);
 assert.strictEqual(apply.ok, true);
 assert.strictEqual(apply.summary.checked, 1);
+assert.ok(apply.leaseStatePath);
 assert.strictEqual(apply.entries[0].semanticLease.granted, true);
+assert.strictEqual(apply.entries[0].semanticLease.source, 'frontier-lease');
+assert.ok(apply.entries[0].semanticLease.leaseId);
+assert.strictEqual(apply.entries[0].semanticLease.fencingToken, 1);
 assert.strictEqual(apply.entries[0].semanticLease.fence.ok, true);
+const leaseState = JSON.parse(await fs.readFile(apply.leaseStatePath, 'utf8'));
+assert.strictEqual(leaseState.kind, 'frontier.semantic-lease.state');
+assert.ok(leaseState.events.some((event) => event.type === 'lease.granted'));
+assert.ok(leaseState.events.some((event) => event.type === 'lease.released'));
 assert.deepStrictEqual(await fs.readFile(path.join(tmp, 'src/index.ts'), 'utf8'), 'export const value = 1;\n');
 
 const localPackageRoot = path.join(tmp, 'local-packages', 'frontier-test');
