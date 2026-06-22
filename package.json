@@ -1,6 +1,6 @@
 {
   "name": "@shapeshift-labs/frontier-swarm-git",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Node Git, workspace, patch, and apply adapter for Frontier swarm runners.",
   "type": "module",
   "license": "MIT",
@@ -52,10 +52,10 @@
     "coordination"
   ],
   "dependencies": {
-    "@shapeshift-labs/frontier": "0.1.9",
-    "@shapeshift-labs/frontier-swarm": "0.5.25"
+    "@shapeshift-labs/frontier": "0.1.9"
   },
   "devDependencies": {
+    "@shapeshift-labs/frontier-swarm": "0.5.25",
     "@types/node": "^26.0.0",
     "typescript": "^6.0.3"
   }

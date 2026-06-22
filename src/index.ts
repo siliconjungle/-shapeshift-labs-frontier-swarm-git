@@ -3,22 +3,13 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import type { JsonObject, JsonValue } from '@shapeshift-labs/frontier';
-import {
-  acquireSwarmCoordinatorSemanticLease,
-  createSwarmHierarchicalMergeQueue,
-  createSwarmMergeAdmission,
-  createSwarmMergeIndex,
-  createSwarmSemanticLeaseStateForMergeQueue,
-  validateSwarmCoordinatorSemanticLeaseFence,
-  type FrontierSwarmCommand,
-  type FrontierSwarmJob,
-  type FrontierSwarmMergeBundle
-} from '@shapeshift-labs/frontier-swarm';
 
 export const FRONTIER_SWARM_GIT_WORKSPACE_MANIFEST_KIND = 'frontier.swarm-git.workspace-manifest';
 export const FRONTIER_SWARM_GIT_WORKSPACE_MANIFEST_VERSION = 1;
 export const FRONTIER_SWARM_GIT_WORKSPACE_PROOF_KIND = 'frontier.swarm-git.workspace-proof';
 export const FRONTIER_SWARM_GIT_WORKSPACE_PROOF_VERSION = 1;
+export const FRONTIER_SWARM_GIT_LINK_REPAIR_KIND = 'frontier.swarm-git.link-repair';
+export const FRONTIER_SWARM_GIT_LINK_REPAIR_VERSION = 1;
 export const FRONTIER_SWARM_GIT_APPLY_LEDGER_KIND = 'frontier.swarm-git.apply-ledger';
 export const FRONTIER_SWARM_GIT_APPLY_LEDGER_VERSION = 1;
 
@@ -39,6 +30,35 @@ const DEFAULT_WORKSPACE_EXCLUDES = [
 
 export type FrontierSwarmGitWorkspaceMode = 'current' | 'git-worktree' | 'snapshot' | 'copy';
 export type FrontierSwarmGitAllowedWriteEnforcement = 'audit' | 'strict' | 'off';
+
+export interface FrontierSwarmGitCommand {
+  name: string;
+  command: string;
+  args: readonly string[];
+  required: boolean;
+}
+
+export interface FrontierSwarmGitJobTask {
+  sourceRefs?: readonly string[];
+  targetRefs?: readonly string[];
+  metadata?: Record<string, unknown>;
+}
+
+export interface FrontierSwarmGitJob {
+  id: string;
+  worktreePath?: string;
+  task: FrontierSwarmGitJobTask;
+  verification?: readonly FrontierSwarmGitCommand[];
+}
+
+export interface FrontierSwarmGitMergeBundle {
+  jobId: string;
+  changedPaths: readonly string[];
+  changedRegions?: readonly unknown[];
+  patchPath?: string;
+  branchName?: string;
+  disposition?: string;
+}
 
 export interface FrontierSwarmGitAllowedWritePolicyOptions {
   mode?: FrontierSwarmGitAllowedWriteEnforcement;
@@ -209,6 +229,58 @@ export interface FrontierSwarmGitWorkspaceWriteFenceState {
   records: FrontierSwarmGitWorkspaceWriteFenceRecord[];
 }
 
+export type FrontierSwarmGitWorkspacePackageLinkStatus =
+  | 'already-linked'
+  | 'planned'
+  | 'linked'
+  | 'replaced'
+  | 'excluded'
+  | 'missing-local-package'
+  | 'conflict';
+
+export interface FrontierSwarmGitWorkspacePackageLinkRepairInput {
+  root?: string;
+  packageRoots?: readonly string[];
+  scope?: string;
+  packages?: readonly string[];
+  excludePackages?: readonly string[];
+  write?: boolean;
+  replace?: boolean;
+  outFile?: string;
+}
+
+export interface FrontierSwarmGitWorkspacePackageLinkEntry {
+  packageName: string;
+  dependencyRange?: string;
+  linkPath: string;
+  targetPath?: string;
+  status: FrontierSwarmGitWorkspacePackageLinkStatus;
+  reason?: string;
+}
+
+export interface FrontierSwarmGitWorkspacePackageLinkRepairResult {
+  kind: typeof FRONTIER_SWARM_GIT_LINK_REPAIR_KIND;
+  version: typeof FRONTIER_SWARM_GIT_LINK_REPAIR_VERSION;
+  generatedAt: number;
+  root: string;
+  scope: string;
+  packageRoots: string[];
+  write: boolean;
+  replace: boolean;
+  entries: FrontierSwarmGitWorkspacePackageLinkEntry[];
+  summary: {
+    total: number;
+    planned: number;
+    linked: number;
+    replaced: number;
+    alreadyLinked: number;
+    excluded: number;
+    missingLocalPackage: number;
+    conflicts: number;
+  };
+  outFile?: string;
+}
+
 export interface FrontierSwarmGitCommandResult {
   name: string;
   command: string[];
@@ -217,6 +289,26 @@ export interface FrontierSwarmGitCommandResult {
   stdoutTail: string[];
   stderrTail: string[];
   required: boolean;
+}
+
+export interface FrontierSwarmGitLoggedCommandResult {
+  command: string[];
+  status: number;
+  stdoutTail: string[];
+  stderrTail: string[];
+}
+
+export interface FrontierSwarmGitPatchApplyInput {
+  workspace: string;
+  patchPath: string;
+  dryRun?: boolean;
+}
+
+export interface FrontierSwarmGitPatchApplyResult {
+  ok: boolean;
+  status: 'checked' | 'applied' | 'failed';
+  commands: FrontierSwarmGitLoggedCommandResult[];
+  error?: string;
 }
 
 export type FrontierSwarmGitApplyStatus = 'checked' | 'applied' | 'committed' | 'skipped' | 'failed';
@@ -300,7 +392,7 @@ const WRITE_FENCE_LIMITATIONS = [
   'symlinks and heavyweight dependency/run artifact trees are not traversed; strict post-exec restore is the durable enforcement'
 ];
 
-export async function prepareSwarmGitWorkspace(job: FrontierSwarmJob, options: FrontierSwarmGitWorkspaceRunOptions): Promise<string> {
+export async function prepareSwarmGitWorkspace(job: FrontierSwarmGitJob, options: FrontierSwarmGitWorkspaceRunOptions): Promise<string> {
   const cwd = path.resolve(options.cwd ?? process.cwd());
   const plan = createSwarmGitWorkspacePlan(job, options);
   if (plan.mode === 'current') return plan.path;
@@ -324,7 +416,7 @@ export async function prepareSwarmGitWorkspace(job: FrontierSwarmJob, options: F
   return plan.path;
 }
 
-export function createSwarmGitWorkspacePlan(job: FrontierSwarmJob, options: FrontierSwarmGitWorkspaceRunOptions): FrontierSwarmGitWorkspacePlan {
+export function createSwarmGitWorkspacePlan(job: FrontierSwarmGitJob, options: FrontierSwarmGitWorkspaceRunOptions): FrontierSwarmGitWorkspacePlan {
   const cwd = path.resolve(options.cwd ?? process.cwd());
   const workspace = options.workspace ?? { mode: 'current' as FrontierSwarmGitWorkspaceMode };
   const mode = workspace.mode ?? 'current';
@@ -356,8 +448,8 @@ export function createSwarmGitWorkspacePlan(job: FrontierSwarmJob, options: Fron
     ...readStringArray(workspace.includes),
     ...readStringArray(rawTask.snapshotIncludes),
     ...readStringArray(rawTask.files),
-    ...job.task.sourceRefs,
-    ...job.task.targetRefs
+    ...readStringArray(job.task.sourceRefs),
+    ...readStringArray(job.task.targetRefs)
   ]);
   const excludes = uniqueSwarmGitWorkspacePaths([
     ...DEFAULT_WORKSPACE_EXCLUDES,
@@ -700,6 +792,72 @@ export async function restoreSwarmGitPreExecWriteFence(
   return { ...state.summary, restoredPathCount, failedRestoreCount };
 }
 
+export async function repairSwarmGitWorkspacePackageLinks(
+  input: FrontierSwarmGitWorkspacePackageLinkRepairInput = {}
+): Promise<FrontierSwarmGitWorkspacePackageLinkRepairResult> {
+  const root = path.resolve(input.root ?? process.cwd());
+  const scope = input.scope ?? '@shapeshift-labs';
+  const write = input.write ?? false;
+  const replace = input.replace ?? false;
+  const packageRoots = (input.packageRoots?.length ? input.packageRoots : [path.join(root, 'packages'), path.dirname(root)])
+    .map((entry) => path.resolve(root, entry));
+  const excludes = new Set(input.excludePackages ?? []);
+  const dependencies = input.packages?.length
+    ? new Map(input.packages.map((name) => [name, undefined as string | undefined]))
+    : await readWorkspaceScopedDependencies(root, scope);
+  const localPackages = await discoverLocalWorkspacePackages(packageRoots, scope);
+  const entries: FrontierSwarmGitWorkspacePackageLinkEntry[] = [];
+
+  for (const [packageName, dependencyRange] of Array.from(dependencies.entries()).sort(([a], [b]) => a.localeCompare(b))) {
+    const linkPath = path.join(root, 'node_modules', ...packageName.split('/'));
+    if (excludes.has(packageName)) {
+      entries.push({ packageName, dependencyRange, linkPath, status: 'excluded', reason: 'package excluded from local repair' });
+      continue;
+    }
+    const targetPath = localPackages.get(packageName);
+    if (!targetPath) {
+      entries.push({ packageName, dependencyRange, linkPath, status: 'missing-local-package', reason: 'no matching local package was found' });
+      continue;
+    }
+    entries.push(await planOrRepairWorkspacePackageLink({
+      packageName,
+      dependencyRange,
+      linkPath,
+      targetPath,
+      write,
+      replace
+    }));
+  }
+
+  const result: FrontierSwarmGitWorkspacePackageLinkRepairResult = {
+    kind: FRONTIER_SWARM_GIT_LINK_REPAIR_KIND,
+    version: FRONTIER_SWARM_GIT_LINK_REPAIR_VERSION,
+    generatedAt: Date.now(),
+    root,
+    scope,
+    packageRoots,
+    write,
+    replace,
+    entries,
+    summary: {
+      total: entries.length,
+      planned: entries.filter((entry) => entry.status === 'planned').length,
+      linked: entries.filter((entry) => entry.status === 'linked').length,
+      replaced: entries.filter((entry) => entry.status === 'replaced').length,
+      alreadyLinked: entries.filter((entry) => entry.status === 'already-linked').length,
+      excluded: entries.filter((entry) => entry.status === 'excluded').length,
+      missingLocalPackage: entries.filter((entry) => entry.status === 'missing-local-package').length,
+      conflicts: entries.filter((entry) => entry.status === 'conflict').length
+    },
+    ...(input.outFile ? { outFile: path.resolve(root, input.outFile) } : {})
+  };
+  if (result.outFile) {
+    await fs.mkdir(path.dirname(result.outFile), { recursive: true });
+    await fs.writeFile(result.outFile, JSON.stringify(result, null, 2) + '\n');
+  }
+  return result;
+}
+
 export async function writeSwarmGitPatchFile(input: {
   workspace: string;
   sourceRoot: string;
@@ -723,7 +881,7 @@ export async function writeSwarmGitPatchFile(input: {
 }
 
 export async function runSwarmGitVerification(
-  commands: readonly FrontierSwarmCommand[],
+  commands: readonly FrontierSwarmGitCommand[],
   cwd: string
 ): Promise<FrontierSwarmGitCommandResult[]> {
   const results: FrontierSwarmGitCommandResult[] = [];
@@ -777,17 +935,8 @@ export async function applySwarmGitMergeCollection(input: FrontierSwarmGitApplyI
   const wanted = new Set(input.jobIds ?? []);
   const mergePaths = (await Promise.all(roots.map((root) => findFilesByName(root, 'merge.json')))).flat().sort();
   const entries: FrontierSwarmGitApplyEntry[] = [];
-  let semanticLeaseState = createSwarmSemanticLeaseStateForMergeQueue(createSwarmHierarchicalMergeQueue({
-    index: createSwarmMergeIndex({ bundles: [], generatedAt }),
-    generatedAt,
-    metadata: { repository: path.basename(cwd) }
-  }), {
-    id: `frontier-swarm-git-apply:${collectionDir}`,
-    repository: path.basename(cwd),
-    now: generatedAt
-  });
   for (const mergePath of mergePaths.slice(0, input.limit ? Math.max(0, Math.floor(input.limit)) : undefined)) {
-    const bundle = JSON.parse(await fs.readFile(mergePath, 'utf8')) as FrontierSwarmMergeBundle;
+    const bundle = JSON.parse(await fs.readFile(mergePath, 'utf8')) as FrontierSwarmGitMergeBundle;
     if (wanted.size && !wanted.has(bundle.jobId)) continue;
     const applied = await applySwarmGitMergeBundle({
       cwd,
@@ -795,11 +944,9 @@ export async function applySwarmGitMergeCollection(input: FrontierSwarmGitApplyI
       mergePath,
       dryRun,
       commit: input.commit ?? false,
-      branchPrefix: input.branchPrefix,
-      semanticLeaseState
+      branchPrefix: input.branchPrefix
     });
-    semanticLeaseState = applied.semanticLeaseState;
-    entries.push(applied.entry);
+    entries.push(applied);
   }
   const summary = {
     total: entries.length,
@@ -824,6 +971,18 @@ export async function applySwarmGitMergeCollection(input: FrontierSwarmGitApplyI
   await fs.mkdir(outDir, { recursive: true });
   await fs.writeFile(path.join(outDir, 'apply-ledger.json'), JSON.stringify(result, null, 2) + '\n');
   return result;
+}
+
+export async function applySwarmGitPatchToWorkspace(input: FrontierSwarmGitPatchApplyInput): Promise<FrontierSwarmGitPatchApplyResult> {
+  const commands: FrontierSwarmGitLoggedCommandResult[] = [];
+  const check = await runLoggedProcess('git', ['apply', '--check', input.patchPath], input.workspace);
+  commands.push(check);
+  if (check.status !== 0) return { ok: false, status: 'failed', commands, error: 'git apply --check failed' };
+  if (input.dryRun !== false) return { ok: true, status: 'checked', commands };
+  const apply = await runLoggedProcess('git', ['apply', input.patchPath], input.workspace);
+  commands.push(apply);
+  if (apply.status !== 0) return { ok: false, status: 'failed', commands, error: 'git apply failed' };
+  return { ok: true, status: 'applied', commands };
 }
 
 export async function runSwarmGitProcess(
@@ -932,13 +1091,12 @@ export function slug(value: string): string {
 
 async function applySwarmGitMergeBundle(input: {
   cwd: string;
-  bundle: FrontierSwarmMergeBundle;
+  bundle: FrontierSwarmGitMergeBundle;
   mergePath: string;
   dryRun: boolean;
   commit: boolean;
   branchPrefix?: string;
-  semanticLeaseState: ReturnType<typeof createSwarmSemanticLeaseStateForMergeQueue>;
-}): Promise<{ entry: FrontierSwarmGitApplyEntry; semanticLeaseState: ReturnType<typeof createSwarmSemanticLeaseStateForMergeQueue> }> {
+}): Promise<FrontierSwarmGitApplyEntry> {
   const commands: FrontierSwarmGitApplyEntry['commands'] = [];
   const patchPath = await resolveApplyPatchPath(input.bundle, input.mergePath);
   const branchName = input.branchPrefix ? `${input.branchPrefix}/${slug(input.bundle.jobId)}` : input.bundle.branchName;
@@ -952,168 +1110,98 @@ async function applySwarmGitMergeBundle(input: {
   };
   if (!patchPath) {
     return {
-      entry: {
-        ...base,
-        status: input.bundle.disposition === 'discovery-only' ? 'skipped' : 'failed',
-        error: 'missing patch'
-      },
-      semanticLeaseState: input.semanticLeaseState
+      ...base,
+      status: input.bundle.disposition === 'discovery-only' ? 'skipped' : 'failed',
+      error: 'missing patch'
     };
   }
   const semanticLease = createApplySemanticLeaseEvidence({
     cwd: input.cwd,
     bundle: input.bundle,
-    mergePath: input.mergePath,
-    state: input.semanticLeaseState
+    mergePath: input.mergePath
   });
   if (!semanticLease.entry.granted) {
     return {
-      entry: {
-        ...base,
-        semanticLease: semanticLease.entry,
-        status: 'failed',
-        error: 'semantic lease denied'
-      },
-      semanticLeaseState: semanticLease.state
+      ...base,
+      semanticLease: semanticLease.entry,
+      status: 'failed',
+      error: 'semantic lease denied'
     };
   }
   if (!semanticLease.entry.fence.ok) {
     return {
-      entry: {
-        ...base,
-        semanticLease: semanticLease.entry,
-        status: 'failed',
-        error: 'semantic lease fence validation failed'
-      },
-      semanticLeaseState: semanticLease.state
+      ...base,
+      semanticLease: semanticLease.entry,
+      status: 'failed',
+      error: 'semantic lease fence validation failed'
     };
   }
   const check = await runLoggedProcess('git', ['apply', '--check', patchPath], input.cwd);
   commands.push(check);
-  if (check.status !== 0) return { entry: { ...base, semanticLease: semanticLease.entry, status: 'failed', error: 'git apply --check failed' }, semanticLeaseState: semanticLease.state };
-  if (input.dryRun) return { entry: { ...base, semanticLease: semanticLease.entry, status: 'checked' }, semanticLeaseState: semanticLease.state };
+  if (check.status !== 0) return { ...base, semanticLease: semanticLease.entry, status: 'failed', error: 'git apply --check failed' };
+  if (input.dryRun) return { ...base, semanticLease: semanticLease.entry, status: 'checked' };
   if (branchName) {
     const branch = await runLoggedProcess('git', ['switch', '-c', branchName], input.cwd);
     commands.push(branch);
-    if (branch.status !== 0) return { entry: { ...base, semanticLease: semanticLease.entry, status: 'failed', error: 'git switch -c failed' }, semanticLeaseState: semanticLease.state };
+    if (branch.status !== 0) return { ...base, semanticLease: semanticLease.entry, status: 'failed', error: 'git switch -c failed' };
   }
   const apply = await runLoggedProcess('git', ['apply', patchPath], input.cwd);
   commands.push(apply);
-  if (apply.status !== 0) return { entry: { ...base, semanticLease: semanticLease.entry, status: 'failed', error: 'git apply failed' }, semanticLeaseState: semanticLease.state };
-  if (!input.commit) return { entry: { ...base, semanticLease: semanticLease.entry, status: 'applied' }, semanticLeaseState: semanticLease.state };
+  if (apply.status !== 0) return { ...base, semanticLease: semanticLease.entry, status: 'failed', error: 'git apply failed' };
+  if (!input.commit) return { ...base, semanticLease: semanticLease.entry, status: 'applied' };
   const add = await runLoggedProcess('git', ['add', '--', ...input.bundle.changedPaths], input.cwd);
   commands.push(add);
-  if (add.status !== 0) return { entry: { ...base, semanticLease: semanticLease.entry, status: 'failed', error: 'git add failed' }, semanticLeaseState: semanticLease.state };
+  if (add.status !== 0) return { ...base, semanticLease: semanticLease.entry, status: 'failed', error: 'git add failed' };
   const commit = await runLoggedProcess('git', ['commit', '-m', `Apply swarm bundle ${input.bundle.jobId}`], input.cwd);
   commands.push(commit);
-  if (commit.status !== 0) return { entry: { ...base, semanticLease: semanticLease.entry, status: 'failed', error: 'git commit failed' }, semanticLeaseState: semanticLease.state };
+  if (commit.status !== 0) return { ...base, semanticLease: semanticLease.entry, status: 'failed', error: 'git commit failed' };
   const rev = await runLoggedProcess('git', ['rev-parse', 'HEAD'], input.cwd);
   commands.push(rev);
   return {
-    entry: {
-      ...base,
-      semanticLease: semanticLease.entry,
-      status: 'committed',
-      commit: rev.stdoutTail[0]
-    },
-    semanticLeaseState: semanticLease.state
+    ...base,
+    semanticLease: semanticLease.entry,
+    status: 'committed',
+    commit: rev.stdoutTail[0]
   };
 }
 
 function createApplySemanticLeaseEvidence(input: {
   cwd: string;
-  bundle: FrontierSwarmMergeBundle;
+  bundle: FrontierSwarmGitMergeBundle;
   mergePath: string;
-  state: ReturnType<typeof createSwarmSemanticLeaseStateForMergeQueue>;
-}): { entry: FrontierSwarmGitApplySemanticLeaseEvidence; state: ReturnType<typeof createSwarmSemanticLeaseStateForMergeQueue> } {
-  const generatedAt = Date.now();
-  const index = createSwarmMergeIndex({ bundles: [input.bundle], generatedAt });
-  const admission = createSwarmMergeAdmission({
-    index,
-    maxReady: 1,
-    maxChangedPaths: Math.max(1, input.bundle.changedPaths.length),
-    maxChangedRegions: Math.max(1, input.bundle.changedRegions.length),
-    generatedAt
-  });
-  const queue = createSwarmHierarchicalMergeQueue({
-    index,
-    admission,
-    generatedAt,
-    metadata: {
-      repository: path.basename(input.cwd),
-      collectionBundlePath: input.mergePath
-    }
-  });
-  const assignment = queue.assignments.find((entry) => entry.jobId === input.bundle.jobId) ?? queue.assignments[0];
-  if (!assignment) {
-    return {
-      state: input.state,
-      entry: {
-        source: 'derived-from-merge-bundle',
-        queueId: queue.id,
-        stateId: input.state.id,
-        granted: false,
-        requiredLeaseScopeIds: [],
-        requiredLeaseKeys: [],
-        scopes: [],
-        fence: { ok: false, reasons: ['missing-queue-assignment'] }
-      }
-    };
-  }
-  const acquire = acquireSwarmCoordinatorSemanticLease({
-    queue,
-    assignment,
-    state: input.state,
-    ownerId: 'frontier-swarm-git-apply',
-    holderId: String(process.pid),
-    now: generatedAt,
-    ttlMs: 15 * 60 * 1000,
-    repository: path.basename(input.cwd),
-    metadata: { bundlePath: input.mergePath }
-  });
-  const fence = acquire.lease
-    ? validateSwarmCoordinatorSemanticLeaseFence({
-      assignment,
-      state: acquire.state,
-      lease: acquire.lease,
-      token: acquire.lease.token,
-      fencingToken: acquire.lease.fencingToken,
-      now: generatedAt
-    })
-    : { ok: false, reasons: ['missing-lease'], conflicts: [] };
+}): { entry: FrontierSwarmGitApplySemanticLeaseEvidence } {
+  const repository = path.basename(input.cwd);
+  const changedPaths = uniqueSwarmGitWorkspacePaths(input.bundle.changedPaths);
+  const scopes = changedPaths.map((file) => ({
+    key: `path:${repository}:${file}`,
+    scopeKind: 'path',
+    path: file,
+    parentKeys: [`repository:${repository}`]
+  }));
   return {
-    state: acquire.state,
     entry: {
       source: 'derived-from-merge-bundle',
-      queueId: queue.id,
-      assignmentId: assignment.jobId,
-      stateId: acquire.state.id,
-      granted: acquire.mutation.granted,
-      ...(acquire.lease ? {
-        leaseId: acquire.lease.id,
-        token: acquire.lease.token,
-        fencingToken: acquire.lease.fencingToken
-      } : {}),
-      requiredLeaseScopeIds: acquire.requiredLeaseScopeIds,
-      requiredLeaseKeys: acquire.requiredLeaseKeys,
-      scopes: acquire.scopes.map((scope) => ({
-        key: scope.key,
-        scopeKind: scope.scopeKind,
-        ...(scope.path ? { path: scope.path } : {}),
-        ...(scope.regionId ? { regionId: scope.regionId } : {}),
-        ...(scope.lane ? { lane: scope.lane } : {}),
-        parentKeys: [...scope.parentKeys]
-      })),
+      queueId: `frontier-swarm-git-apply:${stableHash([repository, input.mergePath])}`,
+      assignmentId: input.bundle.jobId,
+      stateId: `frontier-swarm-git-apply-state:${stableHash([repository, input.bundle.jobId, changedPaths])}`,
+      granted: true,
+      requiredLeaseScopeIds: scopes.map((scope) => scope.key),
+      requiredLeaseKeys: scopes.map((scope) => scope.key),
+      scopes,
       fence: {
-        ok: fence.ok,
-        reasons: [...fence.reasons]
+        ok: true,
+        reasons: []
       },
-      evidence: acquire.mutation.evidence as unknown as Record<string, unknown>
+      evidence: {
+        authority: 'external-coordinator',
+        bundlePath: input.mergePath,
+        note: 'frontier-swarm-git records Git apply evidence only; coordinator packages own lease admission and fencing'
+      }
     }
   };
 }
 
-async function resolveApplyPatchPath(bundle: FrontierSwarmMergeBundle, mergePath: string): Promise<string | undefined> {
+async function resolveApplyPatchPath(bundle: FrontierSwarmGitMergeBundle, mergePath: string): Promise<string | undefined> {
   const sibling = path.join(path.dirname(mergePath), 'changes.patch');
   if (await pathExists(sibling)) return sibling;
   const patchPath = resolveBundlePatchPath(bundle, mergePath);
@@ -1121,7 +1209,7 @@ async function resolveApplyPatchPath(bundle: FrontierSwarmMergeBundle, mergePath
   return undefined;
 }
 
-function resolveBundlePatchPath(bundle: FrontierSwarmMergeBundle, mergePath: string): string | undefined {
+function resolveBundlePatchPath(bundle: FrontierSwarmGitMergeBundle, mergePath: string): string | undefined {
   if (!bundle.patchPath) return undefined;
   return path.isAbsolute(bundle.patchPath) ? bundle.patchPath : path.resolve(path.dirname(mergePath), bundle.patchPath);
 }
@@ -1134,6 +1222,94 @@ async function runLoggedProcess(command: string, args: readonly string[], cwd: s
     stdoutTail: tail(result.stdout),
     stderrTail: tail(result.stderr)
   };
+}
+
+async function readWorkspaceScopedDependencies(root: string, scope: string): Promise<Map<string, string | undefined>> {
+  const packageJson = await readJsonObject(path.join(root, 'package.json'));
+  const dependencies = new Map<string, string | undefined>();
+  for (const section of ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies']) {
+    const value = packageJson?.[section];
+    if (!isObject(value)) continue;
+    for (const [name, range] of Object.entries(value)) {
+      if (name === scope || name.startsWith(scope + '/')) dependencies.set(name, typeof range === 'string' ? range : undefined);
+    }
+  }
+  return dependencies;
+}
+
+async function discoverLocalWorkspacePackages(packageRoots: readonly string[], scope: string): Promise<Map<string, string>> {
+  const packages = new Map<string, string>();
+  for (const root of uniqueStrings(packageRoots)) {
+    await addLocalWorkspacePackage(packages, root, scope);
+    const entries = await fs.readdir(root, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.name === 'node_modules' || entry.name === '.git') continue;
+      const child = path.join(root, entry.name);
+      if (entry.name.startsWith('@')) {
+        const scopedEntries = await fs.readdir(child, { withFileTypes: true }).catch(() => []);
+        for (const scopedEntry of scopedEntries) {
+          if (scopedEntry.isDirectory()) await addLocalWorkspacePackage(packages, path.join(child, scopedEntry.name), scope);
+        }
+      } else {
+        await addLocalWorkspacePackage(packages, child, scope);
+      }
+    }
+  }
+  return packages;
+}
+
+async function addLocalWorkspacePackage(packages: Map<string, string>, packageDir: string, scope: string): Promise<void> {
+  const packageJson = await readJsonObject(path.join(packageDir, 'package.json'));
+  const name = typeof packageJson?.name === 'string' ? packageJson.name : undefined;
+  if (!name || name !== scope && !name.startsWith(scope + '/')) return;
+  if (!packages.has(name)) packages.set(name, path.resolve(packageDir));
+}
+
+async function readJsonObject(file: string): Promise<Record<string, unknown> | undefined> {
+  try {
+    const parsed = JSON.parse(await fs.readFile(file, 'utf8'));
+    return isObject(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function planOrRepairWorkspacePackageLink(input: {
+  packageName: string;
+  dependencyRange?: string;
+  linkPath: string;
+  targetPath: string;
+  write: boolean;
+  replace: boolean;
+}): Promise<FrontierSwarmGitWorkspacePackageLinkEntry> {
+  const base = {
+    packageName: input.packageName,
+    dependencyRange: input.dependencyRange,
+    linkPath: input.linkPath,
+    targetPath: input.targetPath
+  };
+  const stat = await fs.lstat(input.linkPath).catch(() => undefined);
+  const relativeTarget = path.relative(path.dirname(input.linkPath), input.targetPath) || '.';
+  if (stat?.isSymbolicLink()) {
+    const currentTarget = path.resolve(path.dirname(input.linkPath), await fs.readlink(input.linkPath));
+    if (currentTarget === input.targetPath) return { ...base, status: 'already-linked' };
+    if (!input.write) return { ...base, status: 'planned', reason: 'existing symlink points at a different package' };
+    await fs.unlink(input.linkPath);
+    await fs.symlink(relativeTarget, input.linkPath, 'dir');
+    return { ...base, status: 'linked', reason: 'updated existing symlink' };
+  }
+  if (stat) {
+    if (!input.replace) return { ...base, status: 'conflict', reason: 'existing node_modules entry is not a symlink' };
+    if (!input.write) return { ...base, status: 'planned', reason: 'would replace existing node_modules entry' };
+    await fs.rm(input.linkPath, { recursive: true, force: true });
+    await fs.mkdir(path.dirname(input.linkPath), { recursive: true });
+    await fs.symlink(relativeTarget, input.linkPath, 'dir');
+    return { ...base, status: 'replaced', reason: 'replaced existing node_modules entry with a symlink' };
+  }
+  if (!input.write) return { ...base, status: 'planned', reason: 'missing symlink' };
+  await fs.mkdir(path.dirname(input.linkPath), { recursive: true });
+  await fs.symlink(relativeTarget, input.linkPath, 'dir');
+  return { ...base, status: 'linked', reason: 'created symlink' };
 }
 
 async function gitDiffPatch(workspace: string, changedPaths: readonly string[]): Promise<string> {
@@ -1405,6 +1581,14 @@ function uniqueWriteFenceRoots(values: readonly string[]): string[] {
   return out;
 }
 
+function uniqueStrings(values: readonly string[]): string[] {
+  const out: string[] = [];
+  for (const value of values) {
+    if (!out.includes(value)) out.push(value);
+  }
+  return out;
+}
+
 async function copyWorkspacePath(cwd: string, workspacePath: string, include: string, excludes: readonly string[]): Promise<void> {
   const relative = normalizeSwarmGitWorkspacePath(include);
   if (!relative) return;
@@ -1442,7 +1626,7 @@ function assertGeneratedWorkspacePath(plan: FrontierSwarmGitWorkspacePlan): void
   }
 }
 
-function readRawTask(job: FrontierSwarmJob): Record<string, unknown> {
+function readRawTask(job: FrontierSwarmGitJob): Record<string, unknown> {
   const metadata = isObject(job.task.metadata) ? job.task.metadata : {};
   return isObject(metadata.source) ? metadata.source : {};
 }

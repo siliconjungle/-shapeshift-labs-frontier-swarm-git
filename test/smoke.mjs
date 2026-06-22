@@ -120,6 +120,33 @@ assert.strictEqual(apply.entries[0].semanticLease.granted, true);
 assert.strictEqual(apply.entries[0].semanticLease.fence.ok, true);
 assert.deepStrictEqual(await fs.readFile(path.join(tmp, 'src/index.ts'), 'utf8'), 'export const value = 1;\n');
 
+const localPackageRoot = path.join(tmp, 'local-packages', 'frontier-test');
+await fs.mkdir(localPackageRoot, { recursive: true });
+await fs.writeFile(path.join(localPackageRoot, 'package.json'), JSON.stringify({
+  name: '@shapeshift-labs/frontier-test',
+  version: '0.0.0'
+}, null, 2) + '\n');
+await fs.writeFile(path.join(tmp, 'package.json'), JSON.stringify({
+  type: 'module',
+  dependencies: {
+    '@shapeshift-labs/frontier-test': '0.0.0'
+  }
+}, null, 2) + '\n');
+const linkPlan = await api.repairSwarmGitWorkspacePackageLinks({
+  root: tmp,
+  packageRoots: [path.join(tmp, 'local-packages')]
+});
+assert.strictEqual(linkPlan.kind, api.FRONTIER_SWARM_GIT_LINK_REPAIR_KIND);
+assert.strictEqual(linkPlan.summary.planned, 1);
+const linkRepair = await api.repairSwarmGitWorkspacePackageLinks({
+  root: tmp,
+  packageRoots: [path.join(tmp, 'local-packages')],
+  write: true
+});
+assert.strictEqual(linkRepair.summary.linked, 1);
+const linkedTarget = await fs.readlink(path.join(tmp, 'node_modules', '@shapeshift-labs', 'frontier-test'));
+assert.ok(path.resolve(path.join(tmp, 'node_modules', '@shapeshift-labs'), linkedTarget).endsWith('local-packages/frontier-test'));
+
 console.log('frontier swarm git smoke passed');
 
 async function run(command, args, cwd) {

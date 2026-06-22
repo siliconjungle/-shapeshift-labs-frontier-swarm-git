@@ -1,21 +1,25 @@
 import {
   applySwarmGitMergeCollection,
+  applySwarmGitPatchToWorkspace,
   createSwarmGitWorkspaceManifest,
   createSwarmGitWorkspacePlan,
   emptySwarmGitChangedPathCollection,
   filterSwarmGitChangedPaths,
   prepareSwarmGitWorkspace,
+  repairSwarmGitWorkspacePackageLinks,
   runSwarmGitVerification,
   type FrontierSwarmGitApplyResult,
   type FrontierSwarmGitChangedPathCollection,
   type FrontierSwarmGitCommandResult,
+  type FrontierSwarmGitJob,
+  type FrontierSwarmGitPatchApplyResult,
+  type FrontierSwarmGitWorkspacePackageLinkRepairResult,
   type FrontierSwarmGitWorkspaceManifest,
   type FrontierSwarmGitWorkspacePlan,
   type FrontierSwarmGitWorkspaceProof
 } from '../dist/index.js';
-import type { FrontierSwarmJob } from '@shapeshift-labs/frontier-swarm';
 
-declare const job: FrontierSwarmJob;
+declare const job: FrontierSwarmGitJob;
 
 const plan: FrontierSwarmGitWorkspacePlan = createSwarmGitWorkspacePlan(job, {
   cwd: '.',
@@ -28,6 +32,8 @@ const empty: FrontierSwarmGitChangedPathCollection = emptySwarmGitChangedPathCol
 const workspacePromise: Promise<string> = prepareSwarmGitWorkspace(job, { workspace: { mode: 'current' } });
 const verificationPromise: Promise<FrontierSwarmGitCommandResult[]> = runSwarmGitVerification(job.verification, '.');
 const applyPromise: Promise<FrontierSwarmGitApplyResult> = applySwarmGitMergeCollection({ collection: '.', dryRun: true });
+const patchApplyPromise: Promise<FrontierSwarmGitPatchApplyResult> = applySwarmGitPatchToWorkspace({ workspace: '.', patchPath: 'changes.patch' });
+const linkRepairPromise: Promise<FrontierSwarmGitWorkspacePackageLinkRepairResult> = repairSwarmGitWorkspacePackageLinks({ root: '.', packages: ['@shapeshift-labs/frontier'] });
 
 manifest.kind satisfies 'frontier.swarm-git.workspace-manifest';
 plan.mode satisfies string;
@@ -36,4 +42,6 @@ empty.ignoredChangedPathReasons satisfies readonly { path: string; reasonCode: s
 workspacePromise satisfies Promise<string>;
 verificationPromise satisfies Promise<FrontierSwarmGitCommandResult[]>;
 applyPromise satisfies Promise<FrontierSwarmGitApplyResult>;
+patchApplyPromise satisfies Promise<FrontierSwarmGitPatchApplyResult>;
+linkRepairPromise satisfies Promise<FrontierSwarmGitWorkspacePackageLinkRepairResult>;
 ({} as FrontierSwarmGitWorkspaceProof).summary.observedChangedPathCount satisfies number;
