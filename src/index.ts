@@ -311,6 +311,40 @@ export interface FrontierSwarmGitPatchApplyResult {
   error?: string;
 }
 
+export interface FrontierSwarmGitPatchCheckInput {
+  cwd: string;
+  patchPath: string;
+  cached?: boolean;
+}
+
+export interface FrontierSwarmGitPatchCheckResult {
+  ok: boolean;
+  command: FrontierSwarmGitLoggedCommandResult;
+}
+
+export interface FrontierSwarmGitHeadFileInput {
+  cwd: string;
+  file: string;
+  maxBytes?: number;
+}
+
+export interface FrontierSwarmGitHeadFileResult {
+  path: string;
+  sourceText: string;
+  bytes: number;
+}
+
+export interface FrontierSwarmGitBlobHashInput {
+  cwd: string;
+  file: string;
+}
+
+export interface FrontierSwarmGitBlobHashResult {
+  ok: boolean;
+  hash?: string;
+  command: FrontierSwarmGitLoggedCommandResult;
+}
+
 export type FrontierSwarmGitApplyStatus = 'checked' | 'applied' | 'committed' | 'skipped' | 'failed';
 
 export interface FrontierSwarmGitApplyInput {
@@ -983,6 +1017,40 @@ export async function applySwarmGitPatchToWorkspace(input: FrontierSwarmGitPatch
   commands.push(apply);
   if (apply.status !== 0) return { ok: false, status: 'failed', commands, error: 'git apply failed' };
   return { ok: true, status: 'applied', commands };
+}
+
+export async function checkSwarmGitPatch(input: FrontierSwarmGitPatchCheckInput): Promise<FrontierSwarmGitPatchCheckResult> {
+  const args = input.cached ? ['apply', '--check', '--cached', input.patchPath] : ['apply', '--check', input.patchPath];
+  const command = await runLoggedProcess('git', args, input.cwd);
+  return { ok: command.status === 0, command };
+}
+
+export async function readSwarmGitHeadFile(input: FrontierSwarmGitHeadFileInput): Promise<FrontierSwarmGitHeadFileResult | undefined> {
+  if (!await pathExists(path.join(input.cwd, '.git'))) return undefined;
+  const normalized = normalizeSwarmGitWorkspacePath(input.file);
+  if (!normalized) return undefined;
+  const command = await runSwarmGitProcess('git', ['show', `HEAD:${normalized}`], { cwd: input.cwd, allowFailure: true });
+  const bytes = Buffer.byteLength(command.stdout, 'utf8');
+  if (command.status !== 0 || (input.maxBytes !== undefined && bytes > input.maxBytes)) return undefined;
+  return { path: normalized, sourceText: command.stdout, bytes };
+}
+
+export async function readSwarmGitHeadBlobHash(input: FrontierSwarmGitBlobHashInput): Promise<FrontierSwarmGitBlobHashResult> {
+  const normalized = normalizeSwarmGitWorkspacePath(input.file);
+  const command = normalized
+    ? await runLoggedProcess('git', ['rev-parse', `HEAD:${normalized}`], input.cwd)
+    : { command: ['git', 'rev-parse', 'HEAD:<invalid>'], status: 1, stdoutTail: [], stderrTail: ['invalid path'] };
+  const hash = command.status === 0 ? command.stdoutTail[command.stdoutTail.length - 1]?.trim() : undefined;
+  return { ok: command.status === 0 && !!hash, ...(hash ? { hash } : {}), command };
+}
+
+export async function hashSwarmGitWorkspaceFile(input: FrontierSwarmGitBlobHashInput): Promise<FrontierSwarmGitBlobHashResult> {
+  const normalized = normalizeSwarmGitWorkspacePath(input.file);
+  const command = normalized
+    ? await runLoggedProcess('git', ['hash-object', '--', normalized], input.cwd)
+    : { command: ['git', 'hash-object', '--', '<invalid>'], status: 1, stdoutTail: [], stderrTail: ['invalid path'] };
+  const hash = command.status === 0 ? command.stdoutTail[command.stdoutTail.length - 1]?.trim() : undefined;
+  return { ok: command.status === 0 && !!hash, ...(hash ? { hash } : {}), command };
 }
 
 export async function runSwarmGitProcess(

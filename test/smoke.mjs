@@ -84,6 +84,15 @@ assert.strictEqual(writtenPatch, patchPath);
 const patch = await fs.readFile(patchPath, 'utf8');
 assert.match(patch, /diff --git a\/src\/index\.ts b\/src\/index\.ts/);
 assert.match(patch, /export const value = 2/);
+const patchCheck = await api.checkSwarmGitPatch({ cwd: tmp, patchPath });
+assert.strictEqual(patchCheck.ok, true);
+const headSource = await api.readSwarmGitHeadFile({ cwd: tmp, file: 'src/index.ts', maxBytes: 1024 });
+assert.strictEqual(headSource.sourceText, 'export const value = 1;\n');
+const headHash = await api.readSwarmGitHeadBlobHash({ cwd: tmp, file: 'src/index.ts' });
+const workspaceHash = await api.hashSwarmGitWorkspaceFile({ cwd: tmp, file: 'src/index.ts' });
+assert.strictEqual(headHash.ok, true);
+assert.strictEqual(workspaceHash.ok, true);
+assert.strictEqual(headHash.hash, workspaceHash.hash);
 
 const verification = await api.runSwarmGitVerification(job.verification, workspace);
 assert.strictEqual(verification[0].status, 0);
