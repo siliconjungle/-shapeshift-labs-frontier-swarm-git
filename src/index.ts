@@ -457,8 +457,7 @@ export async function prepareSwarmGitWorkspace(job: FrontierSwarmGitJob, options
   }
   if (await pathExists(plan.path)) {
     if (!plan.replace) return plan.path;
-    assertGeneratedWorkspacePath(plan);
-    await fs.rm(plan.path, { recursive: true, force: true });
+    await removeGeneratedWorkspacePath(plan);
   }
   await fs.mkdir(plan.path, { recursive: true });
   for (const include of plan.includes) await copyWorkspacePath(cwd, plan.path, include, plan.excludes);
@@ -1867,6 +1866,37 @@ function assertGeneratedWorkspacePath(plan: FrontierSwarmGitWorkspacePlan): void
   const relative = path.relative(plan.guardRoot ?? plan.root, plan.path);
   if (relative.startsWith('..') || path.isAbsolute(relative) || relative === '') {
     throw new Error(`Refusing to replace workspace outside generated root: ${plan.path}`);
+  }
+}
+
+async function removeGeneratedWorkspacePath(plan: FrontierSwarmGitWorkspacePlan): Promise<void> {
+  assertGeneratedWorkspacePath(plan);
+  try {
+    await fs.rm(plan.path, { recursive: true, force: true });
+    return;
+  } catch (error) {
+    await makeWorkspaceTreeWritable(plan.path).catch(() => {});
+    try {
+      await fs.rm(plan.path, { recursive: true, force: true });
+      return;
+    } catch {
+      throw error;
+    }
+  }
+}
+
+async function makeWorkspaceTreeWritable(target: string): Promise<void> {
+  const stat = await fs.lstat(target).catch(() => undefined);
+  if (!stat) return;
+  if (stat.isSymbolicLink()) return;
+  if (!stat.isDirectory()) {
+    await fs.chmod(target, 0o600).catch(() => {});
+    return;
+  }
+  await fs.chmod(target, 0o700).catch(() => {});
+  const entries = await fs.readdir(target, { withFileTypes: true }).catch(() => []);
+  for (const entry of entries) {
+    await makeWorkspaceTreeWritable(path.join(target, entry.name));
   }
 }
 

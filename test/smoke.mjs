@@ -98,6 +98,23 @@ const verification = await api.runSwarmGitVerification(job.verification, workspa
 assert.strictEqual(verification[0].status, 0);
 assert.strictEqual(verification[0].required, true);
 
+const lockedWorkspaceOptions = {
+  cwd: tmp,
+  outDir: path.join(tmp, 'agent-runs/locked-run'),
+  workspace: { mode: 'copy', root: path.join(tmp, 'locked-worktrees'), includes: ['src'], replace: true, linkNodeModules: false }
+};
+const lockedWorkspace = await api.prepareSwarmGitWorkspace(job, lockedWorkspaceOptions);
+const lockedGithubDir = path.join(lockedWorkspace, '.github');
+await fs.mkdir(lockedGithubDir, { recursive: true });
+await fs.writeFile(path.join(lockedGithubDir, 'stale.txt'), 'stale\n');
+await fs.chmod(path.join(lockedGithubDir, 'stale.txt'), 0o400);
+await fs.chmod(lockedGithubDir, 0o500);
+await fs.writeFile(path.join(tmp, 'src/index.ts'), 'export const value = 3;\n');
+await api.prepareSwarmGitWorkspace(job, lockedWorkspaceOptions);
+assert.strictEqual(await exists(lockedGithubDir), false);
+assert.strictEqual(await fs.readFile(path.join(lockedWorkspace, 'src/index.ts'), 'utf8'), 'export const value = 3;\n');
+await fs.writeFile(path.join(tmp, 'src/index.ts'), 'export const value = 1;\n');
+
 const collectionDir = path.join(tmp, 'collection');
 const bundleDir = path.join(collectionDir, 'ready-to-apply', job.id, 'evidence');
 await fs.mkdir(bundleDir, { recursive: true });
@@ -173,4 +190,13 @@ async function run(command, args, cwd) {
     child.on('close', (status) => status === 0 ? resolve() : reject(new Error(`${command} ${args.join(' ')} failed: ${status}`)));
     child.on('error', reject);
   });
+}
+
+async function exists(file) {
+  try {
+    await fs.access(file);
+    return true;
+  } catch {
+    return false;
+  }
 }
